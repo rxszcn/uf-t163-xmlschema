@@ -2,6 +2,19 @@
 CHANGELOG
 *********
 
+Unreleased
+==========
+* Encoding accepts Python standard library native datetime/date/time and
+  timedelta objects for XSD date/time and duration builtin types, converting
+  them through the same elementpath datatypes used for the library's own
+  values (timezone offsets normalized to whole-minute XSD offsets; sub-minute
+  remainders truncated toward zero; out-of-range offsets reported through the
+  encode error contract)
+* Encoding of bytes/bytearray/memoryview for xs:hexBinary and xs:base64Binary
+  now emits the target lexical form (upper-case hexadecimal or standard
+  base64) instead of crashing with an undecorated UnicodeDecodeError; failures
+  are reported as XMLSchemaEncodeError in strict/lax validation
+
 `v4.3.2`_ (2026-06-30)
 ======================
 * Fix for issues #473, #474 and #475

@@ -11,6 +11,7 @@
 This module contains classes for XML Schema simple data types.
 """
 import re
+import datetime
 from collections.abc import Callable, Iterator
 from decimal import DecimalException, Decimal
 from functools import cached_property
@@ -35,6 +36,8 @@ from .validation import ValidationContext, EncodeContext, ValidationMixin, Decod
 from .xsdbase import XsdComponent, XsdType
 from .facets import XsdFacet, XsdWhiteSpaceFacet, XsdPatternFacets, \
     XsdEnumerationFacets, XsdAssertionFacet, MULTIPLE_FACETS
+from .helpers import native_datetime_to_xsd, native_timedelta_to_xsd, \
+    native_binary_to_xsd
 
 FacetsValueType = Union[XsdFacet, Callable[[Any], None], list[XsdAssertionFacet]]
 PythonTypeClasses = Union[type[Any], tuple[type[Any]]]
@@ -784,10 +787,59 @@ class XsdAtomicBuiltin(XsdAtomic):
 
         return result
 
+    def _adapt_native_object(self, obj: Any, validation: str,
+                             context: EncodeContext) -> Any:
+        """
+        Adapt a Python standard library native object to the elementpath datatype
+        expected by this builtin type. Only stdlib datetime/date/time/timedelta
+        and bytes-like objects are handled; the library's own datatypes and every
+        other value are returned unchanged so they keep their existing encode path.
+
+        A value that has no natural representation for the target type, or whose
+        conversion fails (e.g. an out-of-range timezone), is reported through the
+        standard encode error contract and None is returned.
+        """
+        primitive_name = self.primitive_type.name
+        target_name = self.name
+        # Build with the target type's own datatype so derived builtins (e.g.
+        # xs:dateTimeStamp, xs:dayTimeDuration) get the required subclass.
+        datatype = self.datatype
+
+        try:
+            if isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
+                adapted = native_datetime_to_xsd(obj, datatype, target_name)
+            elif isinstance(obj, datetime.timedelta):
+                adapted = native_timedelta_to_xsd(obj, datatype, target_name)
+            elif isinstance(obj, (bytes, bytearray, memoryview)):
+                if primitive_name not in (nm.XSD_BASE64_BINARY, nm.XSD_HEX_BINARY):
+                    return obj
+                adapted = native_binary_to_xsd(obj, datatype)
+            else:
+                return obj
+        except (ValueError, TypeError, OverflowError) as err:
+            context.encode_error(validation, self, obj, self.to_python, err)
+            return None
+
+        if adapted is None:
+            msg = _("{0!r} is not an instance of {1!r}").format(obj, self.instance_types)
+            context.encode_error(validation, self, obj, self.to_python, msg)
+            return None
+
+        return adapted
+
     def raw_encode(self, obj: Any, validation: str, context: EncodeContext) \
             -> str | None:
-        if isinstance(obj, (str, bytes)):
+        is_binary_target = self.primitive_type.name in \
+            (nm.XSD_BASE64_BINARY, nm.XSD_HEX_BINARY)
+
+        if isinstance(obj, str) or (isinstance(obj, bytes) and not is_binary_target):
             obj = self.normalize(obj)
+        else:
+            # Adapt raw binary octets and stdlib datetime/duration objects to
+            # the target elementpath datatype before the regular encode path.
+            obj = self._adapt_native_object(obj, validation, context)
+            if obj is None:
+                return None
 
         if validation == 'skip':
             try:
@@ -1498,7 +1550,10 @@ class XsdAtomicRestriction(XsdAtomic):
         if self.is_list():
             if not hasattr(obj, '__iter__') or isinstance(obj, (str, bytes)):
                 obj = [] if obj is None or obj == '' else [obj]
-        elif isinstance(obj, (str, bytes)):
+        elif isinstance(obj, str) or (
+                isinstance(obj, bytes) and
+                self.primitive_type.name not in
+                (nm.XSD_BASE64_BINARY, nm.XSD_HEX_BINARY)):
             obj = self.normalize(obj)
 
         if self.patterns:

@@ -9,7 +9,8 @@
 #
 from decimal import Decimal
 from math import isinf, isnan
-from typing import Optional, SupportsInt, SupportsFloat, TYPE_CHECKING, Union
+from datetime import date, datetime, time, timedelta, tzinfo
+from typing import Any, Optional, SupportsInt, SupportsFloat, TYPE_CHECKING, Union
 from xml.etree.ElementTree import Element
 from elementpath import datatypes
 
@@ -296,3 +297,109 @@ def python_to_float(value: Union[SupportsFloat, str]) -> str:
 
 def python_to_int(value: Union[SupportsInt, str]) -> str:
     return str(int(value))
+
+
+#
+# Adapters for Python standard library native types used in encoding.
+#
+# The library's own elementpath datatypes (AbstractDateTime/Duration/AbstractBinary
+# subclasses) are already part of the builtin 'instance_types', so they keep their
+# existing encode path. These adapters only bridge the parallel standard library
+# classes (datetime/date/time/timedelta and bytes-like objects) that inbound post
+# processing or other code may place directly into the data handed to encoding.
+
+# Number of days assumed for one month when a timedelta (which has no calendar
+# notion) has to be expressed as an xs:yearMonthDuration.
+_DAYS_PER_MONTH = 30
+
+
+def _to_xsd_timezone(tz: tzinfo) -> datatypes.Timezone:
+    """
+    Normalize a standard library tzinfo to an elementpath Timezone.
+
+    XSD timezone offsets are restricted to whole minutes in the range [-14:00,
+    +14:00]. A sub-minute remainder of a stdlib offset cannot be represented, so
+    it is truncated toward zero (the wall-clock fields are preserved rather than
+    shifting the instant). Offsets outside the XSD range raise ValueError, which
+    the encode path reports through the standard encode error contract.
+    """
+    offset = tz.utcoffset(None)
+    if offset is None:
+        raise ValueError(_("timezone provides no UTC offset"))
+
+    total_minutes = offset.days * 24 * 60 + offset.seconds // 60
+    return datatypes.Timezone(timedelta(
+        hours=total_minutes // 60, minutes=total_minutes % 60
+    ))
+
+
+def native_datetime_to_xsd(obj: Union[datetime, date, time],
+                           datatype: type,
+                           xsd_name: str) -> Any:
+    """
+    Convert a standard library datetime/date/time object into the elementpath
+    datatype instance expected by the target builtin type.
+
+    Returns None when the native object has no natural representation for the
+    target type (e.g. a date for xs:time), so the caller reports a regular encode
+    error instead of forcing a lossy or ambiguous conversion.
+    """
+    if xsd_name in (nm.XSD_DATETIME, nm.XSD_DATE_TIME_STAMP):
+        if isinstance(obj, datetime):
+            tz = _to_xsd_timezone(obj.tzinfo) if obj.tzinfo is not None else None
+            return datatype(obj.year, obj.month, obj.day, obj.hour, obj.minute,
+                            obj.second, obj.microsecond, tz)
+        return None
+
+    if xsd_name == nm.XSD_DATE:
+        if isinstance(obj, date):
+            tz = _to_xsd_timezone(obj.tzinfo) if isinstance(obj, datetime) \
+                and obj.tzinfo is not None else None
+            return datatype(obj.year, obj.month, obj.day, tz)
+        return None
+
+    if xsd_name == nm.XSD_TIME:
+        if isinstance(obj, time):
+            tz = _to_xsd_timezone(obj.tzinfo) if obj.tzinfo is not None else None
+            return datatype(obj.hour, obj.minute, obj.second, obj.microsecond, tz)
+        return None
+
+    return None
+
+
+def native_timedelta_to_xsd(obj: timedelta,
+                            datatype: type,
+                            xsd_name: str) -> Any:
+    """
+    Convert a standard library datetime.timedelta into an XSD duration value.
+
+    A timedelta is an exact day/hour/minute/second/microsecond span, so it maps
+    losslessly to xs:duration / xs:dayTimeDuration (months always 0). For
+    xs:yearMonthDuration, which can only hold whole months, the span is converted
+    using a 30-day month and rounded half-away-from-zero to the nearest whole
+    month; this is inherently lossy and documented as such.
+    """
+    if xsd_name == nm.XSD_YEAR_MONTH_DURATION:
+        # Work on whole 30-day units with integer arithmetic to avoid float drift.
+        total_days = obj.days
+        sign = -1 if total_days < 0 else 1
+        months = (abs(total_days) + _DAYS_PER_MONTH // 2) // _DAYS_PER_MONTH
+        return datatype(months=sign * months)
+
+    # xs:duration and xs:dayTimeDuration both accept a day/time (seconds) component.
+    day_time = datatypes.DayTimeDuration.fromtimedelta(obj)
+    if xsd_name == nm.XSD_DAY_TIME_DURATION:
+        return datatype(seconds=day_time.seconds)
+    return datatype(months=0, seconds=day_time.seconds)
+
+
+def native_binary_to_xsd(obj: Union[bytes, bytearray, memoryview],
+                         datatype: type) -> Any:
+    """
+    Encode a standard library bytes-like object as the lexical value of the
+    target xs:hexBinary / xs:base64Binary type and wrap it in the matching
+    elementpath datatype, so later facet validation sees a proper binary value.
+    """
+    raw = bytes(obj)
+    return datatype(datatype.encoder(raw))
+

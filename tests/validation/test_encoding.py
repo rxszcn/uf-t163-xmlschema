@@ -8,6 +8,7 @@
 #
 # @author Davide Brunato <brunato@sissa.it>
 #
+import datetime
 import decimal
 import pathlib
 import unittest
@@ -921,10 +922,237 @@ xsi:schemaLocation="http://example.com/ns/collection collection.xsd">
         self.assertEqual(root.text, 'tns1:bar')
 
 
+class TestNativeStdlibTypesEncoding(XsdValidatorTestCase):
+    """
+    Matrix tests for encoding Python standard library native datetime and
+    binary objects. Each produced lexical value is also decoded back by the
+    same XSD type (spec self-check) and, where meaningful, compared with the
+    encoding of the equivalent library-native elementpath datatype.
+    """
+
+    cases_dir = pathlib.Path(__file__).parent.joinpath('../test_cases')
+
+    def _type(self, xsd_type):
+        schema = self.get_schema(
+            f'<xs:element name="v" type="xs:{xsd_type}"/>'
+        )
+        return schema.elements['v'].type
+
+    # -- datetime / date / time ---------------------------------------------
+
+    def test_native_datetime_matrix(self):
+        xsd_type = self._type('dateTime')
+        value = datetime.datetime(2026, 11, 16, 10, 30, 15, 123456)
+        text = xsd_type.encode(value)
+        self.assertEqual(text, '2026-11-16T10:30:15.123456')
+        # spec self-check: the produced lexical must decode without errors
+        self.assertEqual(xsd_type.decode(text),
+                         datatypes.DateTime10.fromstring(text))
+
+    def test_native_datetime_with_timezone(self):
+        xsd_type = self._type('dateTime')
+        tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+        text = xsd_type.encode(
+            datetime.datetime(2026, 1, 1, 12, 0, tzinfo=tz))
+        self.assertEqual(text, '2026-01-01T12:00:00+05:30')
+        self.assertEqual(xsd_type.decode(text),
+                         datatypes.DateTime10.fromstring(text))
+
+        tz_negative = datetime.timezone(datetime.timedelta(hours=-8))
+        text = xsd_type.encode(
+            datetime.datetime(2026, 1, 1, 12, 0, tzinfo=tz_negative))
+        self.assertEqual(text, '2026-01-01T12:00:00-08:00')
+
+    def test_native_datetime_subminute_timezone_truncated(self):
+        # XSD offsets only carry whole minutes: sub-minute part is truncated
+        # toward zero while the wall-clock fields are preserved.
+        xsd_type = self._type('dateTime')
+        tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30,
+                                                  seconds=45))
+        text = xsd_type.encode(
+            datetime.datetime(2026, 1, 1, 12, 0, tzinfo=tz))
+        self.assertEqual(text, '2026-01-01T12:00:00+05:30')
+
+    def test_native_datetime_out_of_range_timezone(self):
+        xsd_type = self._type('dateTime')
+        tz = datetime.timezone(datetime.timedelta(hours=15))
+        with self.assertRaises(XMLSchemaEncodeError):
+            xsd_type.encode(datetime.datetime(2026, 1, 1, 12, 0, tzinfo=tz))
+        result, errors = xsd_type.encode(
+            datetime.datetime(2026, 1, 1, 12, 0, tzinfo=tz),
+            validation='lax')
+        self.assertIsNone(result)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], XMLSchemaEncodeError)
+
+    def test_native_date_matrix(self):
+        xsd_type = self._type('date')
+        text = xsd_type.encode(datetime.date(2026, 11, 16))
+        self.assertEqual(text, '2026-11-16')
+        self.assertEqual(xsd_type.decode(text),
+                         datatypes.Date10.fromstring(text))
+
+    def test_native_time_matrix(self):
+        xsd_type = self._type('time')
+        text = xsd_type.encode(datetime.time(10, 30, 15, 500000))
+        self.assertEqual(text, '10:30:15.5')
+        self.assertEqual(xsd_type.decode(text),
+                         datatypes.Time.fromstring(text))
+
+    def test_native_time_with_timezone(self):
+        xsd_type = self._type('time')
+        tz = datetime.timezone.utc
+        text = xsd_type.encode(datetime.time(10, 30, tzinfo=tz))
+        self.assertEqual(text, '10:30:00Z')
+
+    def test_native_mismatched_datetime_targets(self):
+        # A date has no natural representation for xs:time: report through
+        # the standard encode error family instead of a naked TypeError.
+        time_type = self._type('time')
+        with self.assertRaises(XMLSchemaEncodeError):
+            time_type.encode(datetime.date(2026, 1, 1))
+        result, errors = time_type.encode(
+            datetime.date(2026, 1, 1), validation='lax')
+        self.assertIsNone(result)
+        self.assertIsInstance(errors[0], XMLSchemaEncodeError)
+
+    # -- duration ------------------------------------------------------------
+
+    def test_native_timedelta_duration_matrix(self):
+        xsd_type = self._type('duration')
+        value = datetime.timedelta(days=2, hours=3, minutes=4,
+                                   seconds=5, microseconds=678901)
+        text = xsd_type.encode(value)
+        self.assertEqual(text, 'P2DT3H4M5.678901S')
+        self.assertEqual(xsd_type.decode(text),
+                         datatypes.Duration.fromstring(text))
+
+    def test_native_timedelta_zero(self):
+        xsd_type = self._type('duration')
+        self.assertEqual(
+            xsd_type.encode(datetime.timedelta(0)), 'PT0S')
+
+    def test_native_timedelta_negative_duration(self):
+        xsd_type = self._type('duration')
+        text = xsd_type.encode(datetime.timedelta(seconds=-1,
+                                                  microseconds=-500000))
+        self.assertEqual(text, '-PT2.5S')
+
+    # -- binary --------------------------------------------------------------
+
+    def test_native_binary_matrix(self):
+        raw = bytes(range(8))
+        expected_hex = '0001020304050607'
+        expected_b64 = 'AAECAwQFBgc='
+
+        for xsd_type_name, expected in (('hexBinary', expected_hex),
+                                        ('base64Binary', expected_b64)):
+            xsd_type = self._type(xsd_type_name)
+            for value in (raw, bytearray(raw), memoryview(raw)):
+                text = xsd_type.encode(value)
+                self.assertEqual(text, expected,
+                                 msg=f'{xsd_type_name} <- {type(value)}')
+                # spec self-check: lexical decodes back to the same octets
+                self.assertEqual(xsd_type.decode(text).decode(), raw)
+
+    def test_native_binary_empty(self):
+        self.assertEqual(self._type('hexBinary').encode(b''), '')
+        self.assertEqual(self._type('base64Binary').encode(b''), '')
+
+    def test_native_binary_all_octets_roundtrip(self):
+        raw = bytes(range(256))
+        for xsd_type_name in ('hexBinary', 'base64Binary'):
+            xsd_type = self._type(xsd_type_name)
+            text = xsd_type.encode(raw)
+            self.assertEqual(xsd_type.decode(text).decode(), raw)
+
+    def test_native_binary_no_naked_crash_in_lax(self):
+        # The original defect: raw non-UTF8 bytes raised UnicodeDecodeError
+        # that pierced even the lax error contract.
+        raw = b'\x00\x01\xfe\xff'
+        for xsd_type_name in ('hexBinary', 'base64Binary'):
+            xsd_type = self._type(xsd_type_name)
+            result, errors = xsd_type.encode(raw, validation='lax')
+            self.assertIsInstance(result, str)
+            self.assertEqual(errors, [])
+
+    def test_native_binary_through_restriction(self):
+        schema = self.get_schema(
+            '<xs:simpleType name="myHex">'
+            '  <xs:restriction base="xs:hexBinary">'
+            '    <xs:length value="4"/>'
+            '  </xs:restriction>'
+            '</xs:simpleType>'
+            '<xs:element name="h" type="myHex"/>')
+        xsd_type = schema.elements['h'].type
+        self.assertEqual(xsd_type.encode(bytes.fromhex('0001feff')),
+                         '0001FEFF')
+        # facet violation is still surfaced through the error contract
+        result, errors = xsd_type.encode(bytes.fromhex('00ff'),
+                                         validation='lax')
+        self.assertEqual(result, '00FF')
+        self.assertEqual(len(errors), 1)
+
+    # -- no-regression: existing behaviors -----------------------------------
+
+    def test_native_library_datatypes_unchanged(self):
+        dt_type = self._type('dateTime')
+        native = datatypes.DateTime10.fromstring('2019-01-01T13:40:00')
+        self.assertEqual(dt_type.encode(native), '2019-01-01T13:40:00')
+
+        hx_type = self._type('hexBinary')
+        self.assertEqual(
+            hx_type.encode(datatypes.HexBinary(b'00D7310A')), '00D7310A')
+        # a plain string keeps its lexical form verbatim
+        self.assertEqual(hx_type.encode('00ff'), '00ff')
+
+    def test_native_string_and_numeric_unchanged(self):
+        string_type = self._type('string')
+        self.assertEqual(string_type.encode('sample'), 'sample')
+        integer_type = self._type('integer')
+        self.assertEqual(integer_type.encode(1000), '1000')
+        decimal_type = self._type('decimal')
+        self.assertEqual(decimal_type.encode(decimal.Decimal('-99.09')),
+                         '-99.09')
+
+
+class TestNativeStdlibTypesEncoding11(TestNativeStdlibTypesEncoding):
+    schema_class = XMLSchema11
+
+    def test_native_timedelta_day_time_duration_matrix(self):
+        xsd_type = self._type('dayTimeDuration')
+        text = xsd_type.encode(datetime.timedelta(hours=3, minutes=4))
+        self.assertEqual(text, 'PT3H4M')
+        self.assertEqual(xsd_type.decode(text),
+                         datatypes.DayTimeDuration.fromstring(text))
+
+    def test_native_timedelta_year_month_duration_rounding(self):
+        xsd_type = self._type('yearMonthDuration')
+        # 30-day month, half-away-from-zero rounding
+        self.assertEqual(xsd_type.encode(datetime.timedelta(days=60)), 'P2M')
+        self.assertEqual(xsd_type.encode(datetime.timedelta(days=44)), 'P1M')
+        self.assertEqual(xsd_type.encode(datetime.timedelta(days=45)), 'P2M')
+        self.assertEqual(xsd_type.encode(datetime.timedelta(days=-45)),
+                         '-P2M')
+        self.assertEqual(xsd_type.encode(datetime.timedelta(days=-44)),
+                         '-P1M')
+
+    def test_native_datetime_stamp_requires_timezone(self):
+        xsd_type = self._type('dateTimeStamp')
+        text = xsd_type.encode(datetime.datetime(
+            2026, 11, 16, 10, 30, tzinfo=datetime.timezone.utc))
+        self.assertEqual(text, '2026-11-16T10:30:00Z')
+        # a naive datetime cannot satisfy the required explicit timezone
+        with self.assertRaises(XMLSchemaValidationError):
+            xsd_type.encode(datetime.datetime(2026, 11, 16, 10, 30))
+
+
 class TestEncoding11(TestEncoding):
     schema_class = XMLSchema11
 
 
 if __name__ == '__main__':
+    from xmlschema.testing import run_xmlschema_tests
+    run_xmlschema_tests('encoding')
     from xmlschema.testing import run_xmlschema_tests
     run_xmlschema_tests('encoding')
